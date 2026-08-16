@@ -23,6 +23,24 @@ class ServerConfig:
     validate_shards: bool = os.environ.get("VIBEVOICE_VALIDATE_SHARDS", "1") not in {"0", "false", "False"}
     # Max concurrent inferences per loaded model
     max_concurrency: int = int(os.environ.get("VIBEVOICE_MAX_CONCURRENCY", "2"))
+    # Max seconds a request will wait for a free concurrency slot before giving
+    # up server-side. Without this, a client that times out and disconnects
+    # leaves its thread blocked on the semaphore (or running generate()) with
+    # no way to reclaim the slot -- every abandoned request then permanently
+    # competes for max_concurrency, and the thread pool backing sync routes
+    # grows without bound since none of those threads ever return. This bounds
+    # the wait (not in-progress generation -- see run_synthesis_pool below for
+    # the thread-pool cap that bounds growth from requests already past this
+    # point).
+    queue_timeout_s: float = float(os.environ.get("VIBEVOICE_QUEUE_TIMEOUT", "240"))
+    # Caps the worker thread pool used to run synthesis (sync FastAPI routes
+    # run in Starlette's default threadpool, which is otherwise unbounded).
+    # Small buffer above max_concurrency for requests waiting on the semaphore
+    # above, so they can still queue and time out promptly rather than being
+    # rejected outright by the pool itself.
+    synthesis_pool_size: int = int(os.environ.get("VIBEVOICE_SYNTHESIS_POOL_SIZE", "0")) or (
+        int(os.environ.get("VIBEVOICE_MAX_CONCURRENCY", "2")) + 4
+    )
     # Logging directory & prompt logging
     logs_dir: str = os.environ.get("VIBEVOICE_LOG_DIR", os.path.join(os.getcwd(), "logs"))
     log_prompts: bool = os.environ.get("VIBEVOICE_LOG_PROMPTS", "1") not in {"0", "false", "False"}

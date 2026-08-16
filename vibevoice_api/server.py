@@ -16,7 +16,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
 
 from vibevoice_api.config import CONFIG
-from vibevoice_api.tts_engine import synthesize, synthesize_stream_pcm
+from vibevoice_api.tts_engine import synthesize, synthesize_stream_pcm, QueueTimeoutError
 from vibevoice_api import auth, observability as obs
 from vibevoice_api.voice_map import VoiceMapper
 import vibevoice_api.config as config_mod
@@ -136,6 +136,21 @@ router = APIRouter(prefix=API_PREFIX or "")
 admin_router = APIRouter(prefix=_ADMIN_KEYS_PREFIX)
 
 app = FastAPI(title="VibeVoice OpenAI-Compatible Audio API")
+
+
+@app.on_event("startup")
+async def _bound_synthesis_threadpool() -> None:
+    # Sync routes (audio_speech below) run in Starlette's default threadpool,
+    # via anyio, which is otherwise unbounded -- every abandoned/queued
+    # request used to spawn a fresh worker thread that never got reclaimed,
+    # since neither a client timeout nor CONFIG.queue_timeout_s (see
+    # tts_engine.py) actually kills the thread, only what it's waiting on.
+    # Capping this is what turns "unbounded thread growth" into "bounded
+    # thread growth, with queue_timeout_s bounding how long each one lives."
+    import anyio.to_thread as _to_thread
+
+    limiter = _to_thread.current_default_thread_limiter()
+    limiter.total_tokens = max(4, CONFIG.synthesis_pool_size)
 
 # Allow CORS for browser-based clients (dev-friendly)
 app.add_middleware(
@@ -580,6 +595,16 @@ def _speech_impl(req: SpeechRequest, base_dir: str, endpoint_path: str):
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except QueueTimeoutError as e:
+        # Distinct from a synthesis failure: this request never got a GPU
+        # slot. 503 + Retry-After tells the client (and its own retry logic)
+        # this is transient server load, not a broken request.
+        log.warning("Queue timeout: %s", e)
+        raise HTTPException(
+            status_code=503,
+            detail=str(e),
+            headers={"Retry-After": str(int(CONFIG.queue_timeout_s))},
+        )
     except Exception as e:
         log.exception("Synthesis failed")
         raise HTTPException(status_code=500, detail=f"synthesis_error: {type(e).__name__}: {e}")

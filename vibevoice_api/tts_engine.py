@@ -28,6 +28,12 @@ from vibevoice.processor.vibevoice_processor import VibeVoiceProcessor
 from vibevoice.modular.streamer import AsyncAudioStreamer
 
 
+class QueueTimeoutError(RuntimeError):
+    """Raised when a request waits longer than CONFIG.queue_timeout_s for a
+    free concurrency slot. Distinguished from other RuntimeErrors so the
+    server layer can map it to 503 instead of 500."""
+
+
 @dataclass
 class LoadedModel:
     processor: VibeVoiceProcessor
@@ -410,7 +416,20 @@ def synthesize(
         if torch.is_tensor(v):
             inputs[k] = v.to(state.device)
 
-    with state.semaphore:
+    # acquire(timeout=...) instead of the semaphore-as-context-manager form:
+    # a thread blocked forever here is exactly what let abandoned requests
+    # (client already gave up, gone) go on holding a concurrency slot and a
+    # thread-pool worker indefinitely. A bounded wait means a request that's
+    # been queued too long fails fast and releases the thread instead of
+    # accumulating -- see docs/07-expansion.md's VibeVoice-7B addendum
+    # (halo-prep repo) for the incident that motivated this.
+    acquired = state.semaphore.acquire(timeout=CONFIG.queue_timeout_s)
+    if not acquired:
+        raise QueueTimeoutError(
+            f"Timed out after {CONFIG.queue_timeout_s}s waiting for a free "
+            f"synthesis slot (max_concurrency={CONFIG.max_concurrency})"
+        )
+    try:
         with torch.inference_mode():
             # Optionally override diffusion steps per request
             old_steps = getattr(state.model, 'ddpm_inference_steps', None)
@@ -449,6 +468,8 @@ def synthesize(
                         state.model.set_ddpm_inference_steps(old_steps)
                     except Exception:
                         pass
+    finally:
+        state.semaphore.release()
 
     speech = outputs.speech_outputs[0]
     if isinstance(speech, torch.Tensor):
@@ -635,7 +656,23 @@ async def synthesize_stream_pcm(
             tls_set = getattr(state.model.model, 'set_thread_local_noise_scheduler', None)
             tls_clear = getattr(state.model.model, 'clear_thread_local_noise_scheduler', None)
             tls_get = getattr(state.model.model, 'get_thread_local_noise_scheduler', None)
-            with state.semaphore:
+            try:
+                # See the matching comment in synthesize() -- bounded wait so
+                # an abandoned streaming request can't hold a slot/thread
+                # forever.
+                if not state.semaphore.acquire(timeout=CONFIG.queue_timeout_s):
+                    raise QueueTimeoutError(
+                        f"Timed out after {CONFIG.queue_timeout_s}s waiting for a "
+                        f"free synthesis slot (max_concurrency={CONFIG.max_concurrency})"
+                    )
+            except Exception:
+                # Without this, get_stream()'s consumer below waits forever
+                # for a chunk or the stop_signal that generate() would
+                # otherwise emit -- a pre-acquire failure never reaches
+                # generate() at all, so nothing else would ever unblock it.
+                async_streamer.end()
+                raise
+            try:
                 with torch.inference_mode():
                     try:
                         old_steps = getattr(state.model, 'ddpm_inference_steps', None)
@@ -664,6 +701,8 @@ async def synthesize_stream_pcm(
                                 state.model.set_ddpm_inference_steps(old_steps)
                             except Exception:
                                 pass
+            finally:
+                state.semaphore.release()
 
         loop = asyncio.get_running_loop()
         # run generate in thread executor to avoid blocking event loop
