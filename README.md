@@ -2,6 +2,42 @@
 
 > This is an OpenAI-compatible API for VibeVoice.
 
+## This fork
+
+Fork of [vibevoice-community/VibeVoice-API](https://github.com/vibevoice-community/VibeVoice-API)
+with a fix for a production issue found while running this server behind
+[Open Notebook](https://github.com/lfnovo/open-notebook) on concurrent podcast-generation
+traffic: **abandoned requests were never cancelled server-side, and each one leaked a thread.**
+
+`synthesize()` and `synthesize_stream_pcm()` (`vibevoice_api/tts_engine.py`) acquired the
+concurrency semaphore with a plain blocking `with state.semaphore:`. A client that gave up after
+its own timeout left the server with no way to know — the request kept running (or waiting) to
+completion regardless, permanently holding both its thread (FastAPI's default thread pool for sync
+routes is otherwise unbounded) and, while running, the concurrency slot. Under real concurrent
+load this compounds: two back-to-back batches of 5 concurrent requests pinned a GPU at 99% for over
+30 minutes and grew the server's thread count from a ~95-thread baseline to 356, never dropping —
+recoverable only by restarting the process.
+
+Fixed in [`e32cd9b`](https://github.com/sjvrensburg/VibeVoice-API/commit/e32cd9b901da183b4e1d1db69cfba5c51c76a0cf):
+
+- `state.semaphore.acquire(timeout=CONFIG.queue_timeout_s)` replaces the unbounded form in both
+  the sync and streaming synthesis paths. A request that can't get a slot in time raises a new
+  `QueueTimeoutError` and releases its thread immediately instead of waiting indefinitely. New env
+  var: `VIBEVOICE_QUEUE_TIMEOUT` (default `240` seconds).
+- `server.py` maps `QueueTimeoutError` to `503` + `Retry-After`, distinct from a `500` synthesis
+  failure, so callers can tell transient load from a broken request.
+- The streaming (SSE) path calls `AsyncAudioStreamer.end()` on a pre-generate failure so its
+  consumer loop can't hang waiting for a stop signal that would otherwise never arrive.
+- App startup caps `anyio`'s default thread limiter to `VIBEVOICE_SYNTHESIS_POOL_SIZE` (default
+  `max_concurrency + 4`), bounding how many sync-route worker threads can exist concurrently in
+  the first place — this is what actually stops orphaned requests from being *able* to accumulate
+  a thread each, complementing the queue timeout rather than duplicating it.
+
+Verified against a real reproduction: 5 concurrent long-clip requests at
+`VIBEVOICE_MAX_CONCURRENCY=1`, 3 correctly fail with a clean `503` at ~246s instead of hanging, the
+other 2 succeed normally, and the thread count returns to a stable steady state afterward instead
+of climbing indefinitely.
+
 ## Community
 
 **Join the unofficial Discord community: https://discord.gg/ZDEYTTRxWG** - share samples, ask questions, discuss fine-tuning, etc.
