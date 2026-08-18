@@ -17,7 +17,12 @@ from copy import deepcopy
 import torch
 
 from vibevoice_api.audio_utils import apply_speed, to_bytes_for_format, float_to_pcm16, ffmpeg_stream_cmd
+import logging
+
 from vibevoice_api.config import CONFIG
+from vibevoice_api import verify
+
+log = logging.getLogger("vibevoice_api.tts_engine")
 from vibevoice_api.voice_map import VoiceMapper
 from vibevoice_api import observability as obs
 
@@ -219,7 +224,7 @@ def _load_model(model_path: str) -> LoadedModel:
         return loaded
 
 
-def synthesize(
+def _synthesize_once(
     *,
     root_dir: str,
     text: str,
@@ -488,6 +493,62 @@ def synthesize(
     data, content_type = to_bytes_for_format(wav, state.sample_rate, response_format)
     return data, content_type
 
+
+def synthesize(**kwargs) -> Tuple[bytes, str]:
+    """synthesize() with optional post-hoc verification and retry.
+
+    Transparent passthrough unless VIBEVOICE_VERIFY=1. See vibevoice_api.verify
+    for why this exists: VibeVoice rarely (~1.7% of clips, measured) emits
+    fluent audio that is not the requested text, stochastically and without any
+    textual trigger, so detection is the only available remedy.
+
+    Failure policy is deliberately lenient. If whisper cannot be run, or every
+    attempt scores low, we return the audio anyway rather than erroring: a
+    request that returns imperfect speech is strictly better for the caller than
+    one that returns nothing, and a silently missing whisper binary must not
+    turn into a hard outage. Verification only ever *adds* attempts.
+    """
+    data, content_type = _synthesize_once(**kwargs)
+
+    if not CONFIG.verify:
+        return data, content_type
+
+    text = kwargs.get("text") or ""
+    if len(text.strip()) < CONFIG.verify_min_chars:
+        return data, content_type
+    # Only WAV can be handed to whisper as-is; re-encoding mp3/opus here would
+    # cost more than the check is worth.
+    if (kwargs.get("response_format") or "wav").lower() != "wav":
+        return data, content_type
+    if not verify.available(CONFIG.verify_whisper_bin, CONFIG.verify_whisper_model):
+        log.warning("verify: enabled but whisper bin/model not usable; skipping")
+        return data, content_type
+
+    best = (data, content_type)
+    best_score = -1.0
+    for attempt in range(CONFIG.verify_retries + 1):
+        s = verify.score(text, data, CONFIG.verify_whisper_bin,
+                         CONFIG.verify_whisper_model)
+        if s is None:                      # could not check -> accept
+            return data, content_type
+        if s > best_score:
+            best, best_score = (data, content_type), s
+        if s >= CONFIG.verify_threshold:
+            # Log every pass, not just retried ones. A verification pass that is
+            # silent when it works is indistinguishable from one that is not
+            # running at all -- and this whole feature exists because a defect
+            # went unnoticed for want of a check.
+            log.info("verify: passed (%.3f) on attempt %d", s, attempt + 1)
+            return data, content_type
+        log.warning("verify: attempt %d scored %.3f < %.2f -- resynthesizing",
+                    attempt + 1, s, CONFIG.verify_threshold)
+        if attempt == CONFIG.verify_retries:
+            break
+        data, content_type = _synthesize_once(**kwargs)
+
+    log.error("verify: all %d attempts below threshold; returning best (%.3f)",
+              CONFIG.verify_retries + 1, best_score)
+    return best
 
 async def synthesize_stream_pcm(
     *,

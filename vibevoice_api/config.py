@@ -21,6 +21,30 @@ class ServerConfig:
     ffmpeg_path: str = os.environ.get("VIBEVOICE_FFMPEG", "ffmpeg")
     # Validation toggle for local shards (1=on, 0=off)
     validate_shards: bool = os.environ.get("VIBEVOICE_VALIDATE_SHARDS", "1") not in {"0", "false", "False"}
+    # ---- Synthesis verification (off by default) --------------------------
+    # VibeVoice occasionally produces a garbled clip: fluent-sounding audio that
+    # is not the requested text. Measured on a real 59-clip podcast episode:
+    # 1 clip (1.7%) came out as grammatical nonsense ("These are illiterary
+    # enterprises"). It is stochastic, not text-triggered -- the exact text that
+    # failed in production synthesized cleanly 20/20 times on re-test -- so it
+    # cannot be avoided by prompt or model choice, only detected.
+    #
+    # When enabled, each clip is transcribed with whisper.cpp and compared to
+    # the input text; below the threshold it is re-synthesized. Clean clips
+    # score ~1.000 and garbled ones score far below, so the separation is wide
+    # and the threshold is not delicate.
+    #
+    # Off by default: it adds an ASR pass per clip and a hard dependency on a
+    # whisper.cpp binary + model that most deployments will not have.
+    verify: bool = os.environ.get("VIBEVOICE_VERIFY", "0") not in {"0", "false", "False", ""}
+    verify_threshold: float = float(os.environ.get("VIBEVOICE_VERIFY_THRESHOLD", "0.75"))
+    verify_retries: int = int(os.environ.get("VIBEVOICE_VERIFY_RETRIES", "2"))
+    verify_whisper_bin: str = os.environ.get("VIBEVOICE_VERIFY_WHISPER_BIN", "")
+    verify_whisper_model: str = os.environ.get("VIBEVOICE_VERIFY_WHISPER_MODEL", "")
+    # Skip verification for very short inputs -- ASR similarity is unstable on a
+    # few words, and a spurious retry costs a full synthesis.
+    verify_min_chars: int = int(os.environ.get("VIBEVOICE_VERIFY_MIN_CHARS", "40"))
+
     # Max concurrent inferences per loaded model
     max_concurrency: int = int(os.environ.get("VIBEVOICE_MAX_CONCURRENCY", "2"))
     # Max seconds a request will wait for a free concurrency slot before giving
