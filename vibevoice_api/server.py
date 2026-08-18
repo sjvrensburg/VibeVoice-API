@@ -139,6 +139,23 @@ app = FastAPI(title="VibeVoice OpenAI-Compatible Audio API")
 
 
 @app.on_event("startup")
+async def _announce_verification() -> None:
+    """State the verification mode at boot.
+
+    Without this, "verification is on" is only knowable by reading env vars of a
+    running process. It was silently off once because of exactly that gap.
+    """
+    from vibevoice_api import verify as _verify
+    if not CONFIG.verify:
+        logging.getLogger("vibevoice_api").info("verify: DISABLED (VIBEVOICE_VERIFY unset)")
+        return
+    ok = _verify.available(CONFIG.verify_whisper_bin, CONFIG.verify_whisper_model)
+    logging.getLogger("vibevoice_api").info(
+        "verify: ENABLED threshold=%.2f retries=%d whisper_usable=%s",
+        CONFIG.verify_threshold, CONFIG.verify_retries, ok)
+
+
+@app.on_event("startup")
 async def _bound_synthesis_threadpool() -> None:
     # Sync routes (audio_speech below) run in Starlette's default threadpool,
     # via anyio, which is otherwise unbounded -- every abandoned/queued

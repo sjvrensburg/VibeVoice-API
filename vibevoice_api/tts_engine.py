@@ -517,12 +517,19 @@ def synthesize(**kwargs) -> Tuple[bytes, str]:
     if not CONFIG.verify:
         return data, content_type
 
+    # Every skip says why. A verification pass that silently declines to run is
+    # indistinguishable from one that ran and passed, and both are
+    # indistinguishable from the feature being broken.
     text = kwargs.get("text") or ""
     if len(text.strip()) < CONFIG.verify_min_chars:
+        log.info("verify: skipped (text %d chars < %d)", len(text.strip()),
+                 CONFIG.verify_min_chars)
         return data, content_type
     # Only WAV can be handed to whisper as-is; re-encoding mp3/opus here would
     # cost more than the check is worth.
-    if (kwargs.get("response_format") or "wav").lower() != "wav":
+    fmt = (kwargs.get("response_format") or "wav").lower()
+    if fmt != "wav":
+        log.info("verify: skipped (response_format=%s, only wav is checked)", fmt)
         return data, content_type
     if not verify.available(CONFIG.verify_whisper_bin, CONFIG.verify_whisper_model):
         log.warning("verify: enabled but whisper bin/model not usable; skipping")
@@ -533,7 +540,12 @@ def synthesize(**kwargs) -> Tuple[bytes, str]:
     for attempt in range(CONFIG.verify_retries + 1):
         s = verify.score(text, data, CONFIG.verify_whisper_bin,
                          CONFIG.verify_whisper_model)
-        if s is None:                      # could not check -> accept
+        if s is None:
+            # Could not check -> accept the audio, but SAY SO. Silently
+            # accepting here makes a broken whisper indistinguishable from a
+            # clean pass, which defeats the entire feature.
+            log.warning("verify: could not transcribe (whisper failed); "
+                        "accepting clip unchecked")
             return data, content_type
         if s > best_score:
             best, best_score = (data, content_type), s
