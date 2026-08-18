@@ -566,7 +566,7 @@ def synthesize(**kwargs) -> Tuple[bytes, str]:
               CONFIG.verify_retries + 1, best_score)
     return best
 
-async def synthesize_stream_pcm(
+async def _synthesize_stream_pcm_once(
     *,
     root_dir: str,
     text: str,
@@ -583,6 +583,9 @@ async def synthesize_stream_pcm(
     instructions_repeat: Optional[int] = None,
 ) -> AsyncIterator[np.ndarray]:
     """Asynchronously generate audio and yield PCM float chunks as numpy arrays.
+
+    Single attempt, no verification -- see synthesize_stream_pcm() below for the
+    verified wrapper every caller should actually use.
 
     Yields:
         np.ndarray: mono float32 waveform chunk in [-1, 1].
@@ -805,3 +808,74 @@ async def synthesize_stream_pcm(
             state.processor.system_prompt = original_system_prompt
         except Exception:
             pass
+
+
+async def synthesize_stream_pcm(*, text: str, **kwargs) -> AsyncIterator[np.ndarray]:
+    """Verified wrapper around _synthesize_stream_pcm_once().
+
+    Every streaming caller went through the unwrapped generator unverified before
+    this fix: VIBEVOICE_VERIFY was wired only into the non-streaming synthesize(),
+    so a request routed through server.py's SSE/binary-stream branches (the path
+    Open Notebook's podcast pipeline actually uses, via esperanto's
+    openai_compatible TTS provider -- see halo-prep's docs/07-expansion.md TTS
+    addendum) produced no verify log line at all: not a pass, not a skip, not a
+    warning. That is indistinguishable from the feature not running, which is
+    exactly what went unnoticed until a real episode needed it. Root-caused via
+    halo-prep by comparing journalctl for vibevoice-api: "verify: ENABLED" fired
+    on every startup, but "verify: passed" fired for exactly one request out of
+    several -- the one direct/manual (non-streaming) test call.
+
+    Streaming here is a chunked-HTTP transport detail, not a live-playback
+    requirement for this API's actual callers (a podcast pipeline assembling an
+    episode file, not a listener waiting on the first sample) -- so buffering the
+    full clip before verifying trades latency, not correctness, for the same
+    guarantee the non-streaming path already gives. It passes through with zero
+    added latency when verification does not apply, on the same triggers
+    synthesize() itself skips on: disabled, text below verify_min_chars, or
+    whisper not usable.
+    """
+    if not CONFIG.verify:
+        async for chunk in _synthesize_stream_pcm_once(text=text, **kwargs):
+            yield chunk
+        return
+    if len(text.strip()) < CONFIG.verify_min_chars:
+        log.info("verify: skipped (stream, text %d chars < %d)",
+                 len(text.strip()), CONFIG.verify_min_chars)
+        async for chunk in _synthesize_stream_pcm_once(text=text, **kwargs):
+            yield chunk
+        return
+    if not verify.available(CONFIG.verify_whisper_bin, CONFIG.verify_whisper_model):
+        log.warning("verify: enabled but whisper bin/model not usable; skipping (stream)")
+        async for chunk in _synthesize_stream_pcm_once(text=text, **kwargs):
+            yield chunk
+        return
+
+    best_chunks: List[np.ndarray] = []
+    best_score = -1.0
+    for attempt in range(CONFIG.verify_retries + 1):
+        chunks: List[np.ndarray] = [
+            c async for c in _synthesize_stream_pcm_once(text=text, **kwargs)
+        ]
+        full = np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
+        wav_bytes, _ = to_bytes_for_format(full, CONFIG.sample_rate, "wav")
+        s = verify.score(text, wav_bytes, CONFIG.verify_whisper_bin, CONFIG.verify_whisper_model)
+        if s is None:
+            log.warning("verify: could not transcribe (whisper failed, stream); "
+                        "accepting clip unchecked")
+            for chunk in chunks:
+                yield chunk
+            return
+        if s > best_score:
+            best_chunks, best_score = chunks, s
+        if s >= CONFIG.verify_threshold:
+            log.info("verify: passed (%.3f) on attempt %d (stream)", s, attempt + 1)
+            for chunk in chunks:
+                yield chunk
+            return
+        log.warning("verify: attempt %d scored %.3f < %.2f -- resynthesizing (stream)",
+                    attempt + 1, s, CONFIG.verify_threshold)
+
+    log.error("verify: all %d attempts below threshold; returning best (%.3f) (stream)",
+              CONFIG.verify_retries + 1, best_score)
+    for chunk in best_chunks:
+        yield chunk
