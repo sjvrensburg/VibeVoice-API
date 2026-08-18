@@ -512,30 +512,45 @@ def synthesize(**kwargs) -> Tuple[bytes, str]:
     one that returns nothing, and a silently missing whisper binary must not
     turn into a hard outage. Verification only ever *adds* attempts.
     """
-    data, content_type = _synthesize_once(**kwargs)
-
-    if not CONFIG.verify:
-        return data, content_type
+    text = kwargs.get("text") or ""
+    requested_fmt = (kwargs.get("response_format") or "wav").lower()
 
     # Every skip says why. A verification pass that silently declines to run is
     # indistinguishable from one that ran and passed, and both are
     # indistinguishable from the feature being broken.
-    text = kwargs.get("text") or ""
-    if len(text.strip()) < CONFIG.verify_min_chars:
+    verify_applies = (
+        CONFIG.verify
+        and len(text.strip()) >= CONFIG.verify_min_chars
+        and verify.available(CONFIG.verify_whisper_bin, CONFIG.verify_whisper_model)
+    )
+    if CONFIG.verify and len(text.strip()) < CONFIG.verify_min_chars:
         log.info("verify: skipped (text %d chars < %d)", len(text.strip()),
                  CONFIG.verify_min_chars)
-        return data, content_type
-    # Only WAV can be handed to whisper as-is; re-encoding mp3/opus here would
-    # cost more than the check is worth.
-    fmt = (kwargs.get("response_format") or "wav").lower()
-    if fmt != "wav":
-        log.info("verify: skipped (response_format=%s, only wav is checked)", fmt)
-        return data, content_type
-    if not verify.available(CONFIG.verify_whisper_bin, CONFIG.verify_whisper_model):
+    elif CONFIG.verify and not verify.available(CONFIG.verify_whisper_bin, CONFIG.verify_whisper_model):
         log.warning("verify: enabled but whisper bin/model not usable; skipping")
+
+    if not verify_applies:
+        data, content_type = _synthesize_once(**kwargs)
         return data, content_type
 
-    best = (data, content_type)
+    # 2026-08-18: this used to skip verification outright whenever
+    # response_format != wav ("only WAV can be handed to whisper as-is"),
+    # reasoning that transcoding here to check would cost more than it's
+    # worth. In practice this meant EVERY real request from Open Notebook was
+    # unverified: OpenAI-compatible TTS clients ask for mp3 by default, so a
+    # deployment that only ever receives mp3 requests got zero protection
+    # from a feature that reported itself ENABLED at startup -- caught live,
+    # mid-episode, by checking journalctl for verify lines during an actual
+    # production podcast run and finding "verify: skipped (response_format=
+    # mp3, ...)" on every single clip. The fix is cheap: internally synthesize
+    # and verify against WAV regardless of what was requested (to_bytes_for_
+    # format() already builds WAV first for every non-wav format anyway, see
+    # audio_utils.py), and only transcode to the caller's requested format
+    # once, on the accepted clip, instead of on every attempt.
+    wav_kwargs = {**kwargs, "response_format": "wav"}
+    data, _ = _synthesize_once(**wav_kwargs)
+
+    best = data
     best_score = -1.0
     for attempt in range(CONFIG.verify_retries + 1):
         s = verify.score(text, data, CONFIG.verify_whisper_bin,
@@ -546,25 +561,38 @@ def synthesize(**kwargs) -> Tuple[bytes, str]:
             # clean pass, which defeats the entire feature.
             log.warning("verify: could not transcribe (whisper failed); "
                         "accepting clip unchecked")
-            return data, content_type
+            best = data
+            break
         if s > best_score:
-            best, best_score = (data, content_type), s
+            best, best_score = data, s
         if s >= CONFIG.verify_threshold:
             # Log every pass, not just retried ones. A verification pass that is
             # silent when it works is indistinguishable from one that is not
             # running at all -- and this whole feature exists because a defect
             # went unnoticed for want of a check.
             log.info("verify: passed (%.3f) on attempt %d", s, attempt + 1)
-            return data, content_type
+            break
         log.warning("verify: attempt %d scored %.3f < %.2f -- resynthesizing",
                     attempt + 1, s, CONFIG.verify_threshold)
         if attempt == CONFIG.verify_retries:
+            log.error("verify: all %d attempts below threshold; returning best (%.3f)",
+                      CONFIG.verify_retries + 1, best_score)
             break
-        data, content_type = _synthesize_once(**kwargs)
+        data, _ = _synthesize_once(**wav_kwargs)
 
-    log.error("verify: all %d attempts below threshold; returning best (%.3f)",
-              CONFIG.verify_retries + 1, best_score)
-    return best
+    if requested_fmt == "wav":
+        return best, "audio/wav"
+    # `best` is already WAV-encoded bytes (that's what verification needs), not
+    # the raw float array to_bytes_for_format() expects -- transcode the bytes
+    # directly instead of re-deriving a numpy array.
+    if requested_fmt == "pcm":
+        import wave as _wave
+        with _wave.open(io.BytesIO(best), "rb") as wf:
+            return wf.readframes(wf.getnframes()), "audio/pcm"
+    if requested_fmt in {"mp3", "opus", "aac"}:
+        from vibevoice_api.audio_utils import _ffmpeg_transcode
+        return _ffmpeg_transcode(best, CONFIG.sample_rate, requested_fmt)
+    raise ValueError(f"Unsupported response_format: {requested_fmt}")
 
 async def _synthesize_stream_pcm_once(
     *,
