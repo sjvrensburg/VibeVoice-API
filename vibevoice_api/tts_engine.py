@@ -22,7 +22,11 @@ import logging
 from vibevoice_api.config import CONFIG
 from vibevoice_api import verify
 
-log = logging.getLogger("vibevoice_api.tts_engine")
+# "vibevoice_api", not a ".tts_engine" child: the server attaches its handler
+# to that exact logger, and a child's records were not reaching the journal --
+# verification ran but logged nothing, which is the one outcome this feature
+# must never have.
+log = logging.getLogger("vibevoice_api")
 from vibevoice_api.voice_map import VoiceMapper
 from vibevoice_api import observability as obs
 
