@@ -431,7 +431,7 @@ def _synthesize_once(
     # thread-pool worker indefinitely. A bounded wait means a request that's
     # been queued too long fails fast and releases the thread instead of
     # accumulating -- see docs/07-expansion.md's VibeVoice-7B addendum
-    # (halo-prep repo) for the incident that motivated this.
+    # (the author's private halo-prep runbook) for the incident that motivated this.
     acquired = state.semaphore.acquire(timeout=CONFIG.queue_timeout_s)
     if not acquired:
         raise QueueTimeoutError(
@@ -845,8 +845,8 @@ async def synthesize_stream_pcm(*, text: str, **kwargs) -> AsyncIterator[np.ndar
     this fix: VIBEVOICE_VERIFY was wired only into the non-streaming synthesize(),
     so a request routed through server.py's SSE/binary-stream branches (the path
     Open Notebook's podcast pipeline actually uses, via esperanto's
-    openai_compatible TTS provider -- see halo-prep's docs/07-expansion.md TTS
-    addendum) produced no verify log line at all: not a pass, not a skip, not a
+    openai_compatible TTS provider -- see docs/07-expansion.md's TTS addendum in
+    the author's private halo-prep runbook) produced no verify log line at all: not a pass, not a skip, not a
     warning. That is indistinguishable from the feature not running, which is
     exactly what went unnoticed until a real episode needed it. Root-caused via
     halo-prep by comparing journalctl for vibevoice-api: "verify: ENABLED" fired
