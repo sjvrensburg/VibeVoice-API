@@ -10,7 +10,7 @@ class ServerConfig:
     port: int = int(os.environ.get("VIBEVOICE_API_PORT", "8000"))
     base_path: str = os.environ.get("VIBEVOICE_API_BASE_PATH", "/v1")
     # Path or HF ID of the model to load by default
-    model_path: str = os.environ.get("VIBEVOICE_MODEL", "microsoft/VibeVoice-1.5b")
+    model_path: str = os.environ.get("VIBEVOICE_MODEL", "microsoft/VibeVoice-1.5B")
     # Device preference: auto, cuda, mps, cpu
     device_preference: str = os.environ.get("VIBEVOICE_DEVICE", "auto")
     # Number of diffusion steps for inference
