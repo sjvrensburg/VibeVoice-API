@@ -34,7 +34,8 @@ dependencies = [
     "absl-py",
     "gradio",
     "av",
-    "aiortc"
+    "aiortc",
+    "prometheus-client" # imported by vibevoice_api.server and observability for /metrics
 ]
 
 
